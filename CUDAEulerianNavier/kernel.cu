@@ -364,44 +364,36 @@ struct cuspTriple
 	int row, col;
 	float amount;
 };
-//int countBuffer[mapW][mapH];
-cusp::array1d<float, cusp::host_memory> pressure(mapW * mapH);
+int countBuffer[mapW][mapH];
+cusp::array1d<float, cusp::host_memory> pressure;
 void project()
 {
-	/*{
-		int counter = 0;
-		for (int y = 0; y < mapH; ++y)
+	int counter = 0;
+	for (int y = 0; y < mapH; ++y)
+	{
+		for (int x = 0; x < mapW; ++x)
 		{
-			for (int x = 0; x < mapW; ++x)
+			if (type[y * mapW + x] == WATER)
 			{
-				if (type[y * mapW + x] == WATER)
-				{
-					countBuffer[x][y] = counter;
-					++counter;
-				}
-				else
-					countBuffer[x][y] = -1;
+				countBuffer[x][y] = counter;
+				++counter;
 			}
+			else
+				countBuffer[x][y] = -1;
 		}
-	}*/
+	}
+	pressure = cusp::array1d<float, cusp::host_memory>(counter);
 	
-	cusp::array1d<float, cusp::host_memory> b(mapW * mapH);
+	cusp::array1d<float, cusp::host_memory> b(counter);
 	{
 		float scale = rho / dt;
 		for (int y = 0; y < mapH; ++y)
 		{
 			for (int x = 0; x < mapW; ++x)
 			{
-				/*int index = countBuffer[x][y];
+				int index = countBuffer[x][y];
 				if (index == -1)
-					continue;*/
-				int index = y * mapW + x;
-				
-				/*if (type[y * mapW + x] != WATER)
-				{
-					b[index] = 0;
 					continue;
-				}*/
 
 				b[index] = scale * (u->at(x + 1, y) - u->at(x, y) +
 					v->at(x, y + 1) - v->at(x, y));
@@ -418,79 +410,86 @@ void project()
 				float scale = 1;
 				int n = 0;
 
-				/*if (type[y * mapW + x] != WATER)
-				{
+				int index = countBuffer[x][y];
+				if (index == -1)
 					continue;
-				}*/
 
 				if (x > 0) 
 				{
 					if (type[y * mapW + x - 1] != SOLID)
 					{
-						if (type[y * mapW + x - 1] == WATER)
+						++n;
+
+						int indexOther = countBuffer[x - 1][y];
+						if (indexOther != -1)
 						{
 							cuspTriple t;
-							t.row = y * mapW + x;
-							t.col = y * mapW + x - 1;
+							t.row = index;
+							t.col = indexOther;
 							t.amount = 1;
 							data.push_back(t);
 						}
-						++n;
 					}
 				}
 				if (y > 0) {
 					if (type[(y - 1) * mapW + x] != SOLID)
 					{
-						if (type[(y - 1) * mapW + x] == WATER)
+						++n;
+
+						int indexOther = countBuffer[x][y - 1];
+						if (indexOther != -1)
 						{
 							cuspTriple t;
-							t.row = y * mapW + x;
-							t.col = (y - 1) * mapW + x;
+							t.row = index;
+							t.col = indexOther;
 							t.amount = 1;
 							data.push_back(t);
 						}
-						++n;
 					}
 				}
 				if (x < mapW - 1) {
 					if (type[y * mapW + x + 1] != SOLID)
 					{
-						if (type[y * mapW + x + 1] == WATER)
+						++n;
+
+						int indexOther = countBuffer[x + 1][y];
+						if (indexOther != -1)
 						{
 							cuspTriple t;
-							t.row = y * mapW + x;
-							t.col = y * mapW + x + 1;
+							t.row = index;
+							t.col = indexOther;
 							t.amount = 1;
 							data.push_back(t);
 						}
-						++n;
 					}
 				}
 				if (y < mapH - 1) {
 					if (type[(y + 1) * mapW + x] != SOLID)
 					{
-						if (type[(y + 1) * mapW + x] == WATER)
+						++n;
+
+						int indexOther = countBuffer[x][y + 1];
+						if (indexOther != -1)
 						{
 							cuspTriple t;
-							t.row = y * mapW + x;
-							t.col = (y + 1) * mapW + x;
+							t.row = index;
+							t.col = indexOther;
 							t.amount = 1;
 							data.push_back(t);
 						}
-						++n;
 					}
 				}
 
 				cuspTriple t;
-				t.row = y * mapW + x;
-				t.col = y * mapW + x;
+				t.row = index;
+				t.col = index;
 				t.amount = -n;
 				data.push_back(t);
 			}
 		}
 
 	}
-	cusp::coo_matrix<int, float, cusp::host_memory> A(mapW * mapH, mapW * mapH, data.size());
+	cusp::coo_matrix<int, float, cusp::host_memory> A(counter, counter, data.size());
 	{
 		for (int i = 0; i < data.size(); ++i)
 		{
@@ -516,7 +515,7 @@ void applyPressure()
 			if (type[y * mapW + x] != WATER)
 				continue;
 
-			float p = pressure[y * mapW + x];
+			float p = pressure[countBuffer[x][y]];
 
 			u->at(x, y) -= scale * p;
 			u->at(x + 1, y) += scale * p;
