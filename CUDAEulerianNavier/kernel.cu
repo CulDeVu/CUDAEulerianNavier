@@ -1,4 +1,5 @@
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <iostream>
@@ -22,6 +23,7 @@
 #include <Windows.h>
 
 #include "fluidQ.h"
+#include "pressureProject.h"
 
 using namespace std;
 using namespace glm;
@@ -31,20 +33,8 @@ imageHeight = 600;
 
 float PI = 3.14159;
 
-const int mapW = 128,
-mapH = 128;
-
-#define dt (1.f / 30.f)
-const float rho = 0.1;
-
-float p[mapW][mapH];
-
 GLFWwindow* window;
 
-enum cellType
-{
-	WATER, AIR, SOLID
-};
 cellType type[mapW * mapH];
 
 vector<vec2> parts;
@@ -84,11 +74,7 @@ __global__ void updateParticles(fluidQ u, fluidQ v, vec2* parts, int numParts, c
 	if (idx >= numParts)
 		return;
 
-	float uVel = u.lerp(parts[idx].x, parts[idx].y);
-	float vVel = v.lerp(parts[idx].x, parts[idx].y);
-
-	parts[idx].x += uVel * dt;
-	parts[idx].y += vVel * dt;
+	RK2Integrator(&(parts[idx].x), &(parts[idx].y), dt, &u, &v);
 
 	if (parts[idx].x < 0)
 		parts[idx].x = 0;
@@ -98,7 +84,7 @@ __global__ void updateParticles(fluidQ u, fluidQ v, vec2* parts, int numParts, c
 		parts[idx].x = mapW - 0.01;
 	if (parts[idx].y > mapH - 0.01)
 		parts[idx].y = mapH - 0.01;
-	
+
 	if (type[(int)parts[idx].y * mapW + (int)parts[idx].x] != SOLID)
 		type[(int)parts[idx].y * mapW + (int)parts[idx].x] = WATER;
 }
@@ -108,7 +94,15 @@ __global__ void updateParticles(fluidQ u, fluidQ v, vec2* parts, int numParts, c
 //-----------------------------------------------------------------------------
 float nrand()
 {
-	return (float)rand() / RAND_MAX;
+	//return 0.5;
+	return (float)rand() / (RAND_MAX + 1);
+}
+
+void checkError()
+{
+	cudaError_t err = cudaGetLastError();
+	if (cudaSuccess != err)
+		printf("error! ID: %d, \"%s\"\n", err, cudaGetErrorString(err));
 }
 
 void spawnUniformParticles(int x, int y, float n)
@@ -117,7 +111,18 @@ void spawnUniformParticles(int x, int y, float n)
 	{
 		for (int j = 0; j < n; ++j)
 		{
-			parts.push_back(vec2(x + nrand() / n + i / n, y + nrand() / n + j / n));
+			float ix = x + nrand() / n + i / n;
+			float iy = y + nrand() / n + j / n;
+
+			/*ix = min(max(0.f, ix), mapW - 0.01.f);
+			iy = min(max(0.f, iy), mapH - 0.01.f);*/
+
+			if (ix < 0) ix = 0;
+			if (ix >= mapW) ix = mapW - 0.001;
+			if (iy < 0) iy = 0;
+			if (iy >= mapH) iy = mapH - 0.001;
+
+			parts.push_back(vec2(ix, iy));
 		}
 	}
 }
@@ -135,9 +140,12 @@ void setupParticles()
 
 	for (int x = 0; x < mapW / 4; ++x)
 	{
-		for (int y = 0; y < mapH; ++y)
+		for (int y = 0; y < mapH / 4; ++y)
 		{
 			spawnUniformParticles(x, y, 2);
+			spawnUniformParticles(x + mapW / 4, y + mapH / 4, 2);
+			spawnUniformParticles(x + 2 * mapW / 4, y + 2 * mapH / 4, 2);
+			spawnUniformParticles(x + 3 * mapW / 4, y + 3 * mapH / 4, 2);
 		}
 	}
 }
@@ -151,7 +159,7 @@ void createWalls()
 	for (int i = 0; i <= 64; ++i)
 	{
 		type[(64 - i) * mapW + i] = SOLID;
-		if (i < 64) 
+		if (i < 64)
 			type[(64 - i - 1) * mapW + i] = SOLID;
 	}
 }
@@ -169,23 +177,44 @@ void clearCellType()
 
 	cudaMemcpy(type_device, &type, mapW * mapH * sizeof(cellType), cudaMemcpyHostToDevice);
 
-	clearCellType <<< numBlocks, blocksize >>> (type_device);
+	clearCellType << < numBlocks, blocksize >> > (type_device);
 	cudaDeviceSynchronize();
 }
 void updateParticles()
 {
-	int blocksize = 1024;
+	int blocksize = 512;
 	int numBlocks = parts.size() / blocksize + 1;
 
 	cudaMemcpy(u_device.cur, u->cur, u->w * u->h * sizeof(float), cudaMemcpyHostToDevice);
 	cudaMemcpy(v_device.cur, v->cur, v->w * v->h * sizeof(float), cudaMemcpyHostToDevice);
 	cudaMemcpy(parts_device, &parts[0], parts.size() * sizeof(vec2), cudaMemcpyHostToDevice);
 
-	updateParticles <<< numBlocks, blocksize >>> (u_device, v_device, parts_device, parts.size(), type_device);
+	updateParticles << < numBlocks, blocksize >> > (u_device, v_device, parts_device, parts.size(), type_device);
 	cudaDeviceSynchronize();
 
 	cudaMemcpy(&parts[0], parts_device, parts.size() * sizeof(vec2), cudaMemcpyDeviceToHost);
 	cudaMemcpy(&type, type_device, mapW * mapH * sizeof(cellType), cudaMemcpyDeviceToHost);
+
+	/*for (int idx = 0; idx < parts.size(); ++idx)
+	{
+	float uVel = u->lerp(parts[idx].x, parts[idx].y);
+	float vVel = v->lerp(parts[idx].x, parts[idx].y);
+
+	parts[idx].x += uVel * dt;
+	parts[idx].y += vVel * dt;
+
+	if (parts[idx].x < 0)
+	parts[idx].x = 0;
+	if (parts[idx].y < 0)
+	parts[idx].y = 0;
+	if (parts[idx].x > mapW - 0.01)
+	parts[idx].x = mapW - 0.01;
+	if (parts[idx].y > mapH - 0.01)
+	parts[idx].y = mapH - 0.01;
+
+	if (type[(int)parts[idx].y * mapW + (int)parts[idx].x] != SOLID)
+	type[(int)parts[idx].y * mapW + (int)parts[idx].x] = WATER;
+	}*/
 }
 int layerField[mapW][mapH];
 void extrapolate()
@@ -292,7 +321,68 @@ void extrapolate()
 	}
 }
 
-vector<int> reposistion;
+int numParts[mapW][mapH];
+void reposition()
+{
+	/*for (int y = 0; y < mapH; ++y)
+	{
+		for (int x = 0; x < mapW; ++x)
+		{
+			numParts[x][y] = 0;
+		}
+	}
+
+	for (int i = 0; i < parts.size(); ++i)
+	{
+		vec2& p = parts[i];
+		int x = p.x;
+		int y = p.y;
+
+		if (numParts[x][y] < 4)
+		{
+			numParts[x][y] += 1;
+		}
+		else
+		{
+			if (y < mapH - 1)
+			{
+				if (type[(y + 1) * mapW + x] == WATER && numParts[x][y + 1] < numParts[x][y])
+				{
+					numParts[x][y + 1] += 1;
+					parts[i] = vec2(x + nrand(), y + 1 + nrand());
+				}
+			}
+			else if (y > 0)
+			{
+				if (type[(y - 1) * mapW + x] == WATER && numParts[x][y - 1] < numParts[x][y])
+				{
+					numParts[x][y - 1] += 1;
+					parts[i] = vec2(x + nrand(), y - 1 + nrand());
+				}
+			}
+
+			else if (x > 0)
+			{
+				if (type[y * mapW + x - 1] == WATER && numParts[x - 1][y] < numParts[x][y])
+				{
+					numParts[x - 1][y] += 1;
+					parts[i] = vec2(x - 1 + nrand(), y + nrand());
+				}
+			}
+			else if (x < mapW - 1)
+			{
+				if (type[y * mapW + x + 1] == WATER && numParts[x + 1][y] < numParts[x][y])
+				{
+					numParts[x + 1][y] += 1;
+					parts[i] = vec2(x + 1 + nrand(), y + nrand());
+				}
+			}
+
+		}
+	}*/
+}
+
+/*vector<int> reposistion;
 int numParts[mapW][mapH];
 void computeReposition()
 {
@@ -357,173 +447,7 @@ void repositionParticles()
 			}
 		}
 	}
-}
-
-struct cuspTriple
-{
-	int row, col;
-	float amount;
-};
-int countBuffer[mapW][mapH];
-cusp::array1d<float, cusp::host_memory> pressure;
-void project()
-{
-	int counter = 0;
-	for (int y = 0; y < mapH; ++y)
-	{
-		for (int x = 0; x < mapW; ++x)
-		{
-			if (type[y * mapW + x] == WATER)
-			{
-				countBuffer[x][y] = counter;
-				++counter;
-			}
-			else
-				countBuffer[x][y] = -1;
-		}
-	}
-	pressure = cusp::array1d<float, cusp::host_memory>(counter);
-	
-	cusp::array1d<float, cusp::host_memory> b(counter);
-	{
-		float scale = rho / dt;
-		for (int y = 0; y < mapH; ++y)
-		{
-			for (int x = 0; x < mapW; ++x)
-			{
-				int index = countBuffer[x][y];
-				if (index == -1)
-					continue;
-
-				b[index] = scale * (u->at(x + 1, y) - u->at(x, y) +
-					v->at(x, y + 1) - v->at(x, y));
-			}
-		}
-	}
-
-	vector<cuspTriple> data;
-	{
-		for (int y = 0; y < mapH; ++y)
-		{
-			for (int x = 0; x < mapW; ++x)
-			{
-				float scale = 1;
-				int n = 0;
-
-				int index = countBuffer[x][y];
-				if (index == -1)
-					continue;
-
-				if (x > 0) 
-				{
-					if (type[y * mapW + x - 1] != SOLID)
-					{
-						++n;
-
-						int indexOther = countBuffer[x - 1][y];
-						if (indexOther != -1)
-						{
-							cuspTriple t;
-							t.row = index;
-							t.col = indexOther;
-							t.amount = 1;
-							data.push_back(t);
-						}
-					}
-				}
-				if (y > 0) {
-					if (type[(y - 1) * mapW + x] != SOLID)
-					{
-						++n;
-
-						int indexOther = countBuffer[x][y - 1];
-						if (indexOther != -1)
-						{
-							cuspTriple t;
-							t.row = index;
-							t.col = indexOther;
-							t.amount = 1;
-							data.push_back(t);
-						}
-					}
-				}
-				if (x < mapW - 1) {
-					if (type[y * mapW + x + 1] != SOLID)
-					{
-						++n;
-
-						int indexOther = countBuffer[x + 1][y];
-						if (indexOther != -1)
-						{
-							cuspTriple t;
-							t.row = index;
-							t.col = indexOther;
-							t.amount = 1;
-							data.push_back(t);
-						}
-					}
-				}
-				if (y < mapH - 1) {
-					if (type[(y + 1) * mapW + x] != SOLID)
-					{
-						++n;
-
-						int indexOther = countBuffer[x][y + 1];
-						if (indexOther != -1)
-						{
-							cuspTriple t;
-							t.row = index;
-							t.col = indexOther;
-							t.amount = 1;
-							data.push_back(t);
-						}
-					}
-				}
-
-				cuspTriple t;
-				t.row = index;
-				t.col = index;
-				t.amount = -n;
-				data.push_back(t);
-			}
-		}
-
-	}
-	cusp::coo_matrix<int, float, cusp::host_memory> A(counter, counter, data.size());
-	{
-		for (int i = 0; i < data.size(); ++i)
-		{
-			A.row_indices[i] = data[i].row;
-			A.column_indices[i] = data[i].col;
-			A.values[i] = data[i].amount;
-		}
-	}
-
-	cusp::default_monitor<float> monitor(b, 600, 0.01, 0);
-	cusp::precond::diagonal<float, cusp::host_memory> M(A);
-
-	cusp::krylov::cg(A, pressure, b, monitor, M);
-}
-void applyPressure()
-{
-	float scale = dt / (rho);
-
-	for (int y = 0; y < mapH; y++)
-	{
-		for (int x = 0; x < mapW; x++)
-		{
-			if (type[y * mapW + x] != WATER)
-				continue;
-
-			float p = pressure[countBuffer[x][y]];
-
-			u->at(x, y) -= scale * p;
-			u->at(x + 1, y) += scale * p;
-			v->at(x, y) -= scale * p;
-			v->at(x, y + 1) += scale * p;
-		}
-	}
-}
+}*/
 
 void enforceBoundary()
 {
@@ -559,22 +483,23 @@ void update()
 	/*static int iter = 0;
 	if (iter > 800)
 	{
-		return;
+	return;
 	}
 	++iter;
 	printf("%d\n", iter);*/
-	
+
 	applyExternal();
 
 	clearCellType();
 	updateParticles();
 	extrapolate();
 
-	computeReposition();
-	repositionParticles();
+	//computeReposition();
+	//repositionParticles();
 
-	project();
-	applyPressure();
+	reposition();
+
+	project(u, v, type);
 
 	enforceBoundary();
 
@@ -583,6 +508,8 @@ void update()
 
 	u->flip();
 	v->flip();
+
+	checkError();
 
 	//printf("%d\n", (int)parts.size());
 
@@ -600,7 +527,6 @@ void update()
 		{
 			printf("-----------------------------\n");
 			printf("V: %f, %f\n", u->lerp(rx, ry), v->lerp(rx, ry));
-			printf("P: %f\n", p[(int)rx][(int)ry]);
 			printf("-----------------------------\n\n");
 		}
 
@@ -650,8 +576,10 @@ void draw()
 		{
 			for (int y = 0; y < mapH; ++y)
 			{
-				float f = numParts[x][y] / 4.f;
-				glColor3f(0, 0, f);
+				//float f = numParts[x][y] / 4.f;
+				glColor3f(0, 0, 0);
+				if (type[y * mapW + x] == WATER)
+					glColor3f(0, 0, 0.7);
 				//glColor3f(0, 0, 0);
 				if (type[y * mapW + x] == SOLID)
 					glColor3f(0, 1, 0);
@@ -670,7 +598,7 @@ void draw()
 	{
 		for (vec2 p : parts)
 		{
-			glVertex2f(p.x, p.y); 
+			glVertex2f(p.x, p.y);
 		}
 	}
 	glEnd();
